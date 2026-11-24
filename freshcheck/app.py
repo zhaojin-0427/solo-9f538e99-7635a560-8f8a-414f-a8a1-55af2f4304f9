@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import logging
 import os
+from urllib.parse import quote
 
-from flask import Flask, flash, redirect, render_template, request, url_for
+from flask import Flask, Response, flash, redirect, render_template, request, url_for
 
 from . import service
 from .csvio import KINDS
@@ -93,6 +94,56 @@ def arrival_detail(arrival_no: str):
         flash(f"找不到到货编号 {arrival_no}。", "error")
         return redirect(url_for("arrivals"))
     return render_template("arrival_detail.html", **detail)
+
+
+def _parse_timeline_form():
+    barcode = request.values.get("barcode", "")
+    start_raw = request.values.get("start", "")
+    end_raw = request.values.get("end", "")
+    return service.parse_timeline_range(barcode, start_raw, end_raw)
+
+
+@app.get("/timeline")
+def timeline_page():
+    """用码时间轴页：输入条码和 UTC 起止时刻，预览覆盖该范围的分段。"""
+    form = {"barcode": "", "start": "", "end": ""}
+    segments: list[dict] = []
+    if request.values.get("barcode") or request.values.get("start") or request.values.get("end"):
+        form = {
+            "barcode": request.values.get("barcode", ""),
+            "start": request.values.get("start", ""),
+            "end": request.values.get("end", ""),
+        }
+        try:
+            barcode, start, end = _parse_timeline_form()
+            with read_conn(get_db_path()) as conn:
+                segments = service.timeline_view(conn, barcode, start, end)
+        except UploadError as exc:
+            flash(f"查询失败：{exc}", "error")
+    return render_template("timeline.html", form=form, segments=segments)
+
+
+@app.get("/timeline/download")
+def timeline_download():
+    """Download the timeline covering [start, end) as a CSV."""
+    try:
+        barcode, start, end = _parse_timeline_form()
+    except UploadError as exc:
+        flash(f"下载失败：{exc}", "error")
+        return redirect(url_for("timeline_page"))
+    with read_conn(get_db_path()) as conn:
+        segments = service.timeline_view(conn, barcode, start, end)
+    data = service.render_timeline_csv(segments, barcode)
+    filename = f"timeline_{barcode}_{start}_{end}.csv"
+    return Response(
+        data,
+        mimetype="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": (
+                f"attachment; filename=\"timeline.csv\"; filename*=UTF-8''{quote(filename)}"
+            )
+        },
+    )
 
 
 @app.post("/check")

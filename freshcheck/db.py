@@ -70,6 +70,23 @@ CREATE TABLE IF NOT EXISTS arrival_issues (
 
 CREATE INDEX IF NOT EXISTS idx_issue_side_ref ON arrival_issues (side, ref);
 
+-- Derived, non-overlapping partition of the overlapping scan_records archive.
+-- One row per (barcode, segment); products_json is the de-duplicated product
+-- set owning the barcode during [starts_at, ends_at).  Ownership gaps are
+-- simply absent here and rendered as [] by the timeline range query.
+-- Maintained inside the same transaction as the archive writes, so the
+-- timeline, the issue cache and release flags always change together.
+CREATE TABLE IF NOT EXISTS barcode_timeline (
+    barcode         TEXT NOT NULL,
+    starts_at       TEXT NOT NULL,             -- UTC 起（含）
+    ends_at         TEXT NOT NULL,             -- UTC 止（不含）
+    products_json   TEXT NOT NULL,             -- JSON 数组，去重后的商品
+    PRIMARY KEY (barcode, starts_at, ends_at)
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS idx_timeline_barcode_time
+    ON barcode_timeline (barcode, starts_at, ends_at);
+
 CREATE TABLE IF NOT EXISTS upload_batches (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     kind            TEXT NOT NULL,
@@ -152,6 +169,10 @@ def init_db(path: str | None = None) -> None:
             conn = connect(target)
             try:
                 conn.executescript(SCHEMA)
+                # executescript() implicitly commits the module-managed
+                # transaction; sync Python's bookkeeping before opening an
+                # explicit one for the migration below.
+                conn.commit()
                 _migrate(conn)
             finally:
                 conn.close()
@@ -180,6 +201,23 @@ def _migrate(conn: sqlite3.Connection) -> None:
             f"UPDATE {table} SET {column} = substr({column}, 1, 19) || '.000000Z' "
             f"WHERE length({column}) = 20 AND {column} LIKE '%Z'"
         )
+
+    # The barcode timeline was added after the first release.  An older
+    # database already carries scan_records ("旧库档案"): materialise the
+    # whole timeline from that archive once.  The first DML above already
+    # opened a (deferred) transaction; touching scan_records upgrades it to a
+    # write lock that serialises this against a concurrent first-boot upload.
+    # user_version is bumped in the same commit, so a crash simply rebuilds.
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    if version < 1:
+        archived = conn.execute("SELECT COUNT(*) AS n FROM scan_records").fetchone()["n"]
+        cached = conn.execute("SELECT COUNT(*) AS n FROM barcode_timeline").fetchone()["n"]
+        if archived and not cached:
+            from .timeline import rebuild_all
+
+            rebuild_all(conn)
+        conn.execute("PRAGMA user_version = 1")
+        conn.commit()
 
 
 @contextmanager

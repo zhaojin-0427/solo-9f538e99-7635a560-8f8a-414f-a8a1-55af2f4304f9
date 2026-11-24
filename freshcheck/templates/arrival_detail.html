@@ -34,8 +34,19 @@
 <p class="empty">无阻断原因。</p>
 {% endif %}
 
-<h3>到货时刻覆盖该条码的用码记录</h3>
-<p class="hint">用码期含起点、不含终点；下表即区间 [起, 止) 覆盖 {{ arrival.arrived_at|utc }} 的记录。</p>
+<h3>到货时刻的用码时间轴归属</h3>
+<p class="hint">
+  放行判定读取预计算的用码时间轴；下表 JSON 数组即到货时刻该条码去重后的商品集合
+  （空档为 <code>[]</code>）。用码期含起点、不含终点。
+</p>
+<table class="kv">
+  <tbody>
+    <tr><th>时间轴商品集合</th><td><code>{{ timeline_products_json }}</code></td></tr>
+  </tbody>
+</table>
+
+<h3>到货时刻覆盖该条码的原始用码记录（佐证）</h3>
+<p class="hint">下表为区间 [起, 止) 覆盖 {{ arrival.arrived_at|utc }} 的原始档案行，仅作佐证；判定不逐条查此表。</p>
 {% if covering_scans %}
 <table>
   <thead><tr><th>记录编号</th><th>商品</th><th>起 (含)</th><th>止 (不含)</th></tr></thead>

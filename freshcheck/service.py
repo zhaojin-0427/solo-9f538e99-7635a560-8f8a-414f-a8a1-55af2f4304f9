@@ -5,20 +5,26 @@ Every write path follows the same contract:
 1. parse and validate the whole file up front;
 2. open one SQLite transaction;
 3. upsert by natural key ("same kind + same number: this upload wins");
-4. recompute the verdicts of exactly the affected arrivals;
-5. write the audit row and commit.
+4. for scan-record uploads, incrementally refresh the derived barcode
+   timeline for exactly the affected barcode × window footprint;
+5. recompute the verdicts of exactly the affected arrivals (the timeline is
+   what the barcode-side rules read);
+6. write the audit row and commit.
 
 If anything raises, the transaction rolls back and the previous base tables,
-worklists and release flags remain exactly as they were.
+timeline, worklists and release flags remain exactly as they were.
 """
 
 from __future__ import annotations
 
+import csv
+import io
+import json
 import sqlite3
 
-from . import rules
+from . import rules, timeline
 from .csvio import KINDS, parse_csv
-from .db import utc_now
+from .db import UploadError, parse_utc, utc_now
 from .sqlutil import chunks, placeholders
 
 UPSERT = {
@@ -76,6 +82,11 @@ def upload(kind: str, filename: str, raw: bytes, db_path: str | None = None) -> 
         with transaction(db_path) as conn:
             previous = _existing_keys(conn, kind, rows)
             affected = _affected_arrivals(conn, kind, rows, previous)
+            # The timeline footprint is computed against both versions of a
+            # corrected record (old barcode/window ∪ new) before the upsert.
+            timeline_spans = (
+                timeline.spans_for_records(rows, previous) if kind == "scan_records" else {}
+            )
             cursor = conn.execute(
                 "INSERT INTO upload_batches (kind, filename, row_count, received_at, status) "
                 "VALUES (?, ?, ?, ?, 'committed')",
@@ -90,6 +101,12 @@ def upload(kind: str, filename: str, raw: bytes, db_path: str | None = None) -> 
                 record["updated_at"] = now
                 payload.append(record)
             conn.executemany(sql, payload)
+            if kind == "scan_records":
+                # Rebuild only the affected barcode × window segments; the
+                # same transaction makes archive, timeline and release flags
+                # visible atomically, so downloads keep serving the previous
+                # complete result until commit.
+                timeline.apply_changes(conn, timeline_spans)
             rules.recheck_arrivals(conn, affected)
             stats = _summary(conn)
     except Exception as exc:
@@ -151,7 +168,10 @@ def _affected_arrivals(
       have (a corrected arrival may have moved to another barcode/line);
     * purchase_lines: all arrivals using the changed po_line_no, before and
       after the change;
-    * scan_records: all arrivals using the changed barcode, before and after.
+    * scan_records: only arrivals on the changed barcode (old ∪ new) whose
+      arrival instant lies inside the old/new archive windows.  A timeline
+      segment outside those windows cannot change, so neither can such an
+      arrival's verdict.
     """
     affected: set[str] = set()
 
@@ -178,12 +198,38 @@ def _affected_arrivals(
         lines |= {old["po_line_no"] for old in previous.values()}
         add_arrivals_by("po_line_no", lines)
     elif kind == "scan_records":
-        barcodes = {row["barcode"] for row in rows}
-        barcodes |= {old["barcode"] for old in previous.values()}
-        add_arrivals_by("barcode", barcodes)
+        affected.update(_arrivals_in_scan_footprint(conn, rows, previous))
 
     # Deliberately scoped to the changed line/barcode (old ∪ new), not a
     # full-table rebuild: only arrivals whose verdict could move are touched.
+    return affected
+
+
+def _arrivals_in_scan_footprint(
+    conn: sqlite3.Connection, rows: list[dict], previous: dict[str, dict]
+) -> set[str]:
+    """Arrivals on the changed barcodes inside the old ∪ new time windows."""
+    per_barcode: dict[str, list[tuple[str, str]]] = {}
+    for source in (rows, previous.values()):
+        for row in source:
+            barcode = row.get("barcode")
+            lo, hi = row.get("starts_at"), row.get("ends_at")
+            if barcode and lo and hi and lo < hi:
+                per_barcode.setdefault(barcode, []).append((lo, hi))
+
+    affected: set[str] = set()
+    for barcode, windows in per_barcode.items():
+        for lo, hi in windows:
+            # Window semantics match the timeline: start inclusive, end
+            # exclusive, so an arrival exactly at hi is outside the footprint.
+            found = conn.execute(
+                """
+                SELECT arrival_no FROM arrivals
+                 WHERE barcode = ? AND arrived_at >= ? AND arrived_at < ?
+                """,
+                (barcode, lo, hi),
+            ).fetchall()
+            affected.update(row["arrival_no"] for row in found)
     return affected
 
 
@@ -229,6 +275,9 @@ def arrival_detail(conn: sqlite3.Connection, arrival_no: str) -> dict | None:
             ORDER BY starts_at, record_no""",
         (arrival["barcode"], arrival["arrived_at"], arrival["arrived_at"]),
     ).fetchall()
+    # The verdict's product set comes from the derived timeline (same data the
+    # download serves); ``covering_scans`` is only supporting raw evidence.
+    timeline_products = timeline.products_at(conn, arrival["barcode"], arrival["arrived_at"])
     from .csvio import human_reason, human_side
 
     return {
@@ -240,6 +289,8 @@ def arrival_detail(conn: sqlite3.Connection, arrival_no: str) -> dict | None:
         "released": len(issues) == 0,
         "purchase_line": dict(line) if line else None,
         "covering_scans": [dict(row) for row in covering],
+        "timeline_products": timeline_products,
+        "timeline_products_json": json.dumps(timeline_products, ensure_ascii=False),
     }
 
 
@@ -318,3 +369,54 @@ def dashboard(conn: sqlite3.Connection) -> dict:
             ).fetchall()
         ],
     }
+
+
+def parse_timeline_range(barcode: str, start_raw: str, end_raw: str) -> tuple[str, str, str]:
+    """Validate the timeline form/query input; raises UploadError on bad input."""
+    barcode = (barcode or "").strip()
+    if not barcode:
+        raise UploadError("条码不能为空")
+    start = parse_utc(start_raw, "UTC 起")
+    end = parse_utc(end_raw, "UTC 止")
+    if end <= start:
+        raise UploadError("UTC 止必须晚于 UTC 起（含起点、不含终点）")
+    return barcode, start, end
+
+
+def timeline_view(
+    conn: sqlite3.Connection, barcode: str, start: str, end: str
+) -> list[dict]:
+    """Timeline segments covering ``[start, end)`` for the download/preview page.
+
+    Inputs go through :func:`parse_utc` so clipping and gap boundaries use the
+    same fixed-width form as the stored segments.  Served entirely from
+    ``barcode_timeline`` — the raw archive is never queried per arrival.
+    Gaps come back as segments whose product list is an empty array.
+    """
+    start = parse_utc(start, "UTC 起")
+    end = parse_utc(end, "UTC 止")
+    segments = timeline.range_segments(conn, barcode, start, end)
+    return [
+        {
+            "starts_at": seg_start,
+            "ends_at": seg_end,
+            "products": products,
+            "products_json": json.dumps(products, ensure_ascii=False),
+        }
+        for seg_start, seg_end, products in segments
+    ]
+
+
+def render_timeline_csv(segments: list[dict], barcode: str) -> bytes:
+    """Serialize timeline segments to a UTF-8-BOM CSV.
+
+    Columns: barcode, UTC start (included), UTC end (excluded), de-duplicated
+    products as a JSON array (``[]`` for ownership gaps).
+    """
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(["条码", "UTC起", "UTC止", "商品"])
+    for segment in segments:
+        writer.writerow([barcode, segment["starts_at"], segment["ends_at"], segment["products_json"]])
+    # BOM lets Excel recognise UTF-8 without an import dialog.
+    return ("﻿" + buffer.getvalue()).encode("utf-8")

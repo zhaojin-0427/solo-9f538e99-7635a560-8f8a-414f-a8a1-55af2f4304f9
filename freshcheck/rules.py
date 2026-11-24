@@ -13,13 +13,16 @@ barcode side (keyed by arrival.barcode and arrival.arrived_at)
 
 The scan window contains its start and excludes its end.  A scan record that
 ends exactly at the arrival instant does not cover it; one that starts exactly
-at the arrival instant does.
+at the arrival instant does.  Barcode-side verdicts read the derived
+``barcode_timeline`` (see :mod:`freshcheck.timeline`), never the overlapping
+raw archive directly.
 """
 
 from __future__ import annotations
 
 import sqlite3
 
+from . import timeline
 from .csvio import human_reason, human_side
 from .sqlutil import chunks, placeholders
 
@@ -28,22 +31,12 @@ BARCODE_SIDE = "barcode"
 
 
 def covering_products(conn: sqlite3.Connection, barcode: str, at: str) -> list[str]:
-    """Distinct products whose scan window covers ``at`` for ``barcode``.
+    """Distinct products owning ``barcode`` at instant ``at``.
 
-    start inclusive, end exclusive.
+    Served from the derived 用码时间轴 rather than querying the overlapping
+    raw archive row by row.  Start inclusive, end exclusive; a gap returns [].
     """
-    rows = conn.execute(
-        """
-        SELECT DISTINCT product
-          FROM scan_records
-         WHERE barcode = ?
-           AND starts_at <= ?
-           AND ends_at > ?
-         ORDER BY product
-        """,
-        (barcode, at, at),
-    ).fetchall()
-    return [row["product"] for row in rows]
+    return timeline.products_at(conn, barcode, at)
 
 
 def evaluate_arrival(conn: sqlite3.Connection, arrival: sqlite3.Row | dict) -> list[dict]:

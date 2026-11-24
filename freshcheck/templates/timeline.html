@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}用码时间轴{% endblock %}
+{% block content %}
+<h2>用码时间轴</h2>
+<p class="hint">
+  输入条码与 UTC 起止时刻，下载覆盖该范围的时间轴 CSV：含起点、不含终点（<code>[起, 止)</code>）。
+  时间轴由用码档案预计算而成，每段给出该时段去重后的商品集合（JSON 数组）；
+  没有任何用码记录覆盖的空档写空数组 <code>[]</code>；相邻且商品集合相同的段已自动合并。
+  到货校验与下载都读取这份时间轴，不再逐条查原始用码档案。
+</p>
+
+<form class="search" method="get" action="{{ url_for('timeline_page') }}">
+  <input type="text" name="barcode" value="{{ form.barcode }}" placeholder="条码" required>
+  <input type="text" name="start" value="{{ form.start }}" placeholder="UTC 起（含），如 2026-11-01T00:00:00Z" required>
+  <input type="text" name="end" value="{{ form.end }}" placeholder="UTC 止（不含）" required>
+  <button type="submit">预览</button>
+  <button type="submit" formaction="{{ url_for('timeline_download') }}" class="ghost">下载 CSV</button>
+</form>
+
+{% if request.values.get('barcode') or request.values.get('start') or request.values.get('end') %}
+<h3>预览分段</h3>
+{% if segments %}
+<table>
+  <thead>
+    <tr><th>UTC 起（含）</th><th>UTC 止（不含）</th><th>商品（JSON 数组）</th><th class="num">商品数</th></tr>
+  </thead>
+  <tbody>
+    {% for seg in segments %}
+    <tr>
+      <td>{{ seg.starts_at|utc }}</td>
+      <td>{{ seg.ends_at|utc }}</td>
+      <td><code>{{ seg.products_json }}</code></td>
+      <td class="num">{{ seg.products|length }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+<p class="hint">共 {{ segments|length }} 段；点「下载 CSV」取得同范围文件（UTF-8 BOM，Excel 可直接打开）。</p>
+{% else %}
+<p class="empty">该范围内没有时间轴数据（请确认输入已通过校验）。</p>
+{% endif %}
+{% endif %}
+{% endblock %}
